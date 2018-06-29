@@ -24,6 +24,7 @@ import (
 	"os"
 	"sync"
 	"time"
+	"strings"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -299,7 +300,8 @@ func protoToSamples(req *prompb.WriteRequest) model.Samples {
 	for _, ts := range req.Timeseries {
 		metric := make(model.Metric, len(ts.Labels))
 		for _, l := range ts.Labels {
-			metric[model.LabelName(l.Name)] = model.LabelValue(l.Value)
+			v := strings.Replace(l.Value, "\n", "", -1)
+			metric[model.LabelName(l.Name)] = model.LabelValue(v)
 		}
 
 		for _, s := range ts.Samples {
