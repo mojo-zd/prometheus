@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/common/model"
+	"github.com/kr/pretty"
 )
 
 var (
@@ -49,11 +50,12 @@ func TestMarshalStoreSamplesRequest(t *testing.T) {
 		Tags:      tagsFromMetric(metric),
 	}
 	expectedJSON := []byte(`{"metric":"test_.metric","timestamp":4711,"value":3.1415,"tags":{"many_chars":"abc_21ABC_.012-3_2145_C3_B667_7E89./","testlabel":"test_.value"}}`)
-
 	resultingJSON, err := json.Marshal(request)
+	pretty.Println("resultingJSON", string(resultingJSON))
 	if err != nil {
 		t.Fatalf("Marshal(request) resulted in err: %s", err)
 	}
+
 	if !bytes.Equal(resultingJSON, expectedJSON) {
 		t.Errorf(
 			"Marshal(request) => %q, want %q",
@@ -73,3 +75,32 @@ func TestMarshalStoreSamplesRequest(t *testing.T) {
 		)
 	}
 }
+
+//func TestBuildQueryReq(t *testing.T) {
+//	query := prompb.Query{
+//		StartTimestampMs: 4700,
+//		EndTimestampMs:   4720,
+//		Matchers: []*prompb.LabelMatcher{
+//			{
+//				Type: prompb.LabelMatcher_EQ,
+//				Name: model.MetricNameLabel,
+//			},
+//		},
+//	}
+//}
+
+//func TestWriteObj(t *testing.T) {
+//	tags := map[string]TagValue{
+//		"instance": TagValue("localhost:9090"),
+//		"job":      TagValue("prometheus"),
+//		"monitor":  TagValue("codelab-monitor"),
+//		"handler":  TagValue("targets"),
+//	}
+//
+//	request := StoreSamplesRequest{
+//		Metric:    "http_response_size_bytes_sum",
+//		Timestamp: 1536906302,
+//		Value:     0,
+//		Tags:      tags,
+//	}
+//}

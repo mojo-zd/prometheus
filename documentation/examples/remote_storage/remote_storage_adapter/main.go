@@ -174,6 +174,7 @@ func buildClients(logger log.Logger, cfg *config) ([]writer, []reader) {
 			cfg.remoteTimeout,
 		)
 		writers = append(writers, c)
+		readers = append(readers, c)
 	}
 	if cfg.influxdbURL != "" {
 		url, err := url.Parse(cfg.influxdbURL)
@@ -245,7 +246,6 @@ func serve(logger log.Logger, addr string, writers []writer, readers []reader) e
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
 		reqBuf, err := snappy.Decode(nil, compressed)
 		if err != nil {
 			level.Error(logger).Log("msg", "Decode error", "err", err.Error())
@@ -266,7 +266,6 @@ func serve(logger log.Logger, addr string, writers []writer, readers []reader) e
 			return
 		}
 		reader := readers[0]
-
 		var resp *prompb.ReadResponse
 		resp, err = reader.Read(&req)
 		if err != nil {
