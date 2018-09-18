@@ -53,3 +53,34 @@ remote_write:
 remote_read:
   - url: "http://localhost:9201/read"
 ```
+
+# Build
+```
+cd prometheus/documentation/examples/remote_storage/remote_storage_adapter
+sh publish.sh
+```
+
+# K8S Deploy Opentsdb Adapter
+```
+apiVersion: apps/v1beta2
+kind: Deployment
+metadata:
+  name: prometheus-adapter
+  labels:
+    app: prometheus-adapter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus-adapter
+  template:
+    metadata:
+      labels:
+        app: prometheus-adapter
+    spec:
+      containers:
+      - name: adapter
+        image: registry.cn-hangzhou.aliyuncs.com/wise2c-test/prometheus-adapter:v2.3
+        args:
+        - -opentsdb-url=http://10.0.0.131:4242
+```
