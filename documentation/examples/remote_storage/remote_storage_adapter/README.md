@@ -54,13 +54,13 @@ remote_read:
   - url: "http://localhost:9201/read"
 ```
 
-# Build
+# Build docker image
 ```
 cd prometheus/documentation/examples/remote_storage/remote_storage_adapter
 sh publish.sh
 ```
 
-# K8S Deploy Opentsdb Adapter
+# K8S Deployment with Opentsdb Adapter
 ```
 apiVersion: apps/v1beta2
 kind: Deployment
@@ -83,4 +83,13 @@ spec:
         image: registry.cn-hangzhou.aliyuncs.com/wise2c-test/prometheus-adapter:v2.3
         args:
         - -opentsdb-url=http://10.0.0.131:4242
+```
+
+```
+influxdb args
+
+- -influxdb-url=http://localhost:8086
+- -influxdb.username=prom
+- -influxdb.database=prometheus
+- -influxdb.retention-policy=autogen
 ```
