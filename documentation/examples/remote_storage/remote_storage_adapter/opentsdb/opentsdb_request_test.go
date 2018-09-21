@@ -10,6 +10,9 @@ import (
 	"net/http"
 	"github.com/kr/pretty"
 	"io/ioutil"
+	"github.com/prometheus/prometheus/prompb"
+	"github.com/go-kit/kit/log"
+	"github.com/prometheus/common/promlog"
 )
 
 var (
@@ -45,7 +48,17 @@ func Unmarshal() []byte {
 			Metric:    "go.gc.duration.seconds",
 			Timestamp: 1537170046,
 			Value:     17,
-			Tags:      map[string]TagValue{"job": TagValue("prometheus"), "monitor": TagValue("codelab-monitor"), "quantile": TagValue("0"), "instance": TagValue("localhost:9099")},
+			Tags: map[string]TagValue{
+				"job":      TagValue("prometheus"),
+				"monitor":  TagValue("codelab-monitor"),
+				"quantile": TagValue("0"),
+				"instance": TagValue("localhost:9099"),
+				"job1":      TagValue("prometheus"),
+				"monitor1":  TagValue("codelab-monitor"),
+				"quantile1": TagValue("0"),
+				"instance1": TagValue("localhost:9099"),
+				"instance2": TagValue("localhost:9099"),
+			},
 		},
 	}
 
@@ -98,3 +111,76 @@ func TestOpentsdbReader(t *testing.T) {
 	o, _ := ioutil.ReadAll(resp.Body)
 	pretty.Println("response is ", string(o))
 }
+
+func TestReq(t *testing.T) {
+	readReq := &prompb.ReadRequest{
+		Queries: []*prompb.Query{{
+			StartTimestampMs: 1537496087552,
+			EndTimestampMs:   1537496387552,
+			Matchers: []*prompb.LabelMatcher{
+				{Type: 0, Name: "__name__", Value: "namespace_name:kube_pod_container_resource_requests_cpu_cores:sum"},
+				{Type: 0, Name: "prometheus", Value: "monitoring/k8s"},
+				{Type: 0, Name: "prometheus_replica", Value: "prometheus-k8s-0"},
+			},
+			Hints: &prompb.ReadHints{StepMs: 0, Func: "sum"},
+		}},
+	}
+
+	logLevel := promlog.AllowedLevel{}
+	logLevel.Set("debug")
+	logger := promlog.New(logLevel)
+	client := NewClient(log.With(logger, "storage", "OpenTSDB"),
+		"http://10.0.0.131:4242",
+		time.Second*30, )
+
+	client.Read(readReq)
+}
+
+func TestSlice(t *testing.T) {
+	//num, remainder := slice(8, 5)
+	//fmt.Println("num ", num, ", remainder", remainder)
+}
+
+// request format
+//`
+//readReq := &prompb.ReadRequest{
+//		Queries: []*prompb.Query{{
+//			StartTimestampMs: 1537496087552,
+//			EndTimestampMs:   1537496387552,
+//			Matchers: []*prompb.LabelMatcher{
+//				{Type: 0, Name: "__name__", Value: "namespace_name:kube_pod_container_resource_requests_cpu_cores:sum"},
+//				{Type: 0, Name: "prometheus", Value: "monitoring/k8s"},
+//				{Type: 0, Name: "prometheus_replica", Value: "prometheus-k8s-0"},
+//			},
+//			Hints: &prompb.ReadHints{StepMs: 0, Func: "sum"},
+//		}},
+//	}
+//`
+
+// converted format: {
+//`
+//{
+//  "start": 1537496087,
+//  "end": 1537496387,
+//  "queries": [
+//    {
+//      "metric": "namespace__name_.kube__pod__container__resource__requests__cpu__cores_.sum",
+//      "filters": [
+//        {
+//          "type": "literal_or",
+//          "tagk": "prometheus",
+//          "filter": "monitoring/k8s",
+//          "groupBy": true
+//        },
+//        {
+//          "type": "literal_or",
+//          "tagk": "prometheus_replica",
+//          "filter": "prometheus-k8s-0",
+//          "groupBy": true
+//        }
+//      ],
+//      "aggregator": "sum"
+//    }
+//  ]
+//}
+//`

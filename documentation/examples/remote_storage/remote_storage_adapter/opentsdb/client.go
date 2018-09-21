@@ -105,7 +105,6 @@ func tagsFromMetric(m model.Metric) map[string]TagValue {
 	return tags
 }
 
-var i = 0
 // Write sends a batch of samples to OpenTSDB via its HTTP API.
 func (c *Client) Write(samples model.Samples) error {
 	reqs := make([]StoreSamplesRequest, 0, len(samples))
@@ -115,13 +114,8 @@ func (c *Client) Write(samples model.Samples) error {
 			//level.Debug(c.logger).Log("msg", "cannot send value to OpenTSDB, skipping sample", "value", v, "sample", s)
 			continue
 		}
-		metric := TagValue(s.Metric[model.MetricNameLabel])
-		reqs = append(reqs, StoreSamplesRequest{
-			Metric:    metric,
-			Timestamp: s.Timestamp.Unix(),
-			Value:     v,
-			Tags:      tagsFromMetric(s.Metric),
-		})
+		//metric := TagValue(s.Metric[model.MetricNameLabel])
+		reqs = append(reqs, tagValueSlice(s)...)
 	}
 
 	if len(reqs) == 0 {
@@ -141,6 +135,7 @@ func (c *Client) Write(samples model.Samples) error {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 	resp, err := ctxhttp.Post(ctx, http.DefaultClient, u.String(), contentTypeJSON, bytes.NewBuffer(buf))
+
 	if err != nil {
 		return err
 	}
@@ -152,7 +147,6 @@ func (c *Client) Write(samples model.Samples) error {
 	if resp.StatusCode == http.StatusNoContent {
 		return nil
 	}
-
 	// API returns status code 400 on error, encoding error details in the
 	// response content in JSON.
 	buf, err = ioutil.ReadAll(resp.Body)
@@ -165,6 +159,37 @@ func (c *Client) Write(samples model.Samples) error {
 		return err
 	}
 	return fmt.Errorf("failed to write %d samples to OpenTSDB, %d succeeded", r["failed"], r["success"])
+}
+
+var tagMax = 8
+
+func tagValueSlice(s *model.Sample) (sampleRequests []StoreSamplesRequest) {
+	tags := tagsFromMetric(s.Metric)
+	sampleLength := len(tags) / tagMax
+	if len(tags)%tagMax != 0 {
+		sampleLength += 1
+	}
+
+	for i := 0; i < sampleLength; i++ {
+		sampleRequests = append(sampleRequests, StoreSamplesRequest{
+			Metric:    TagValue(s.Metric[model.MetricNameLabel]),
+			Timestamp: s.Timestamp.Unix(),
+			Value:     float64(s.Value),
+			Tags:      map[string]TagValue{},
+		})
+	}
+
+	position := 1
+	for key, value := range tags {
+		index := position / tagMax
+		if position%tagMax > 0 {
+			index++
+		}
+		sampleRequests[index-1].Tags[key] = value
+		position ++
+	}
+
+	return
 }
 
 // Read query samples from OpenTSDB via its HTTP API.
@@ -201,8 +226,9 @@ func (c *Client) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) {
 			}
 
 			resp, err := ctxhttp.Post(ctx, http.DefaultClient, c.url+queryEndpoint, contentTypeJSON, bytes.NewBuffer(rawBytes))
+			//fmt.Println("request body-->", string(rawBytes))
 			if err != nil {
-				level.Warn(c.logger).Log("falied to send request to opentsdb")
+				level.Warn(c.logger).Log("falied to reader from opentsdb")
 				errCh <- err
 				return
 			}
