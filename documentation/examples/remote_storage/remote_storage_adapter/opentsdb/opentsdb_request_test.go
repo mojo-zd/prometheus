@@ -49,10 +49,10 @@ func Unmarshal() []byte {
 			Timestamp: 1537170046,
 			Value:     17,
 			Tags: map[string]TagValue{
-				"job":      TagValue("prometheus"),
-				"monitor":  TagValue("codelab-monitor"),
-				"quantile": TagValue("0"),
-				"instance": TagValue("localhost:9099"),
+				"job":       TagValue("prometheus"),
+				"monitor":   TagValue("codelab-monitor"),
+				"quantile":  TagValue("0"),
+				"instance":  TagValue("localhost:9099"),
 				"job1":      TagValue("prometheus"),
 				"monitor1":  TagValue("codelab-monitor"),
 				"quantile1": TagValue("0"),
@@ -134,11 +134,6 @@ func TestReq(t *testing.T) {
 		time.Second*30, )
 
 	client.Read(readReq)
-}
-
-func TestSlice(t *testing.T) {
-	//num, remainder := slice(8, 5)
-	//fmt.Println("num ", num, ", remainder", remainder)
 }
 
 // request format

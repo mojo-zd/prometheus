@@ -226,7 +226,6 @@ func (c *Client) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) {
 			}
 
 			resp, err := ctxhttp.Post(ctx, http.DefaultClient, c.url+queryEndpoint, contentTypeJSON, bytes.NewBuffer(rawBytes))
-			//fmt.Println("request body-->", string(rawBytes))
 			if err != nil {
 				level.Warn(c.logger).Log("falied to reader from opentsdb")
 				errCh <- err
@@ -240,8 +239,15 @@ func (c *Client) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) {
 			}
 
 			if resp.StatusCode != 200 {
+				m := map[string]interface{}{}
+				json.Unmarshal(rawBytes, &m)
+				var message interface{}
+				if v, ok := m["error"]; ok {
+					message = v.(map[string]interface{})["message"]
+				}
+
 				level.Warn(c.logger).Log(fmt.Sprintf("query opentsdb error: %s", string(rawBytes)))
-				errCh <- fmt.Errorf("got status code %v", resp.StatusCode)
+				errCh <- fmt.Errorf("got status code %v, message %s", resp.StatusCode, message)
 				return
 			}
 			var res otdbQueryResSet
