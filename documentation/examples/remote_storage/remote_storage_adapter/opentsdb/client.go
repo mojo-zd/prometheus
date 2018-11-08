@@ -29,11 +29,11 @@ import (
 	"github.com/prometheus/common/model"
 	"golang.org/x/net/context/ctxhttp"
 	"github.com/prometheus/prometheus/prompb"
-	"sync"
 	"strings"
 	"sort"
 	"net"
 	"crypto/tls"
+	"sync"
 )
 
 const (
@@ -208,7 +208,6 @@ func (c *Client) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 	errCh := make(chan error, 1)
-	defer close(errCh)
 	var l sync.Mutex
 	labelsToSeries := map[string]*prompb.TimeSeries{}
 	for i := range queryReqs {
@@ -224,10 +223,9 @@ func (c *Client) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) {
 				errCh <- err
 				return
 			}
-
-			resp, err := ctxhttp.Post(ctx, http.DefaultClient, c.url+queryEndpoint, contentTypeJSON, bytes.NewBuffer(rawBytes))
+			resp, err := ctxhttp.Post(ctx, c.client, c.url+queryEndpoint, contentTypeJSON, bytes.NewBuffer(rawBytes))
 			if err != nil {
-				level.Warn(c.logger).Log("falied to reader from opentsdb")
+				level.Warn(c.logger).Log("falied to send request to opentsdb")
 				errCh <- err
 				return
 			}
@@ -237,17 +235,9 @@ func (c *Client) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) {
 				errCh <- err
 				return
 			}
-
 			if resp.StatusCode != 200 {
-				m := map[string]interface{}{}
-				json.Unmarshal(rawBytes, &m)
-				var message interface{}
-				if v, ok := m["error"]; ok {
-					message = v.(map[string]interface{})["message"]
-				}
-
 				level.Warn(c.logger).Log(fmt.Sprintf("query opentsdb error: %s", string(rawBytes)))
-				errCh <- fmt.Errorf("got status code %v, message %s", resp.StatusCode, message)
+				errCh <- fmt.Errorf("got status code %v", resp.StatusCode)
 				return
 			}
 			var res otdbQueryResSet
