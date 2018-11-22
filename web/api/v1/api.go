@@ -31,11 +31,13 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	jsoniter "github.com/json-iterator/go"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
-	"github.com/prometheus/tsdb"
+	tsdbLabels "github.com/prometheus/tsdb/labels"
 
 	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/pkg/gate"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/textparse"
 	"github.com/prometheus/prometheus/pkg/timestamp"
@@ -47,7 +49,11 @@ import (
 	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/prometheus/util/httputil"
 	"github.com/prometheus/prometheus/util/stats"
-	tsdbLabels "github.com/prometheus/tsdb/labels"
+)
+
+const (
+	namespace = "prometheus"
+	subsystem = "api"
 )
 
 type status string
@@ -77,6 +83,13 @@ var corsHeaders = map[string]string{
 	"Access-Control-Expose-Headers": "Date",
 }
 
+var remoteReadQueries = prometheus.NewGauge(prometheus.GaugeOpts{
+	Namespace: namespace,
+	Subsystem: subsystem,
+	Name:      "remote_read_queries",
+	Help:      "The current number of remote read queries being executed or waiting.",
+})
+
 type apiError struct {
 	typ errorType
 	err error
@@ -87,8 +100,8 @@ func (e *apiError) Error() string {
 }
 
 type targetRetriever interface {
-	TargetsActive() []*scrape.Target
-	TargetsDropped() []*scrape.Target
+	TargetsActive() map[string][]*scrape.Target
+	TargetsDropped() map[string][]*scrape.Target
 }
 
 type alertmanagerRetriever interface {
@@ -117,6 +130,14 @@ func setCORS(w http.ResponseWriter) {
 
 type apiFunc func(r *http.Request) (interface{}, *apiError, func())
 
+// TSDBAdmin defines the tsdb interfaces used by the v1 API for admin operations.
+type TSDBAdmin interface {
+	CleanTombstones() error
+	Delete(mint, maxt int64, ms ...tsdbLabels.Matcher) error
+	Dir() string
+	Snapshot(dir string, withHead bool) error
+}
+
 // API can register a set of endpoints in a router and handle
 // them using the provided storage and query engine.
 type API struct {
@@ -131,10 +152,16 @@ type API struct {
 	flagsMap              map[string]string
 	ready                 func(http.HandlerFunc) http.HandlerFunc
 
-	db              func() *tsdb.DB
-	enableAdmin     bool
-	logger          log.Logger
-	remoteReadLimit int
+	db                    func() TSDBAdmin
+	enableAdmin           bool
+	logger                log.Logger
+	remoteReadSampleLimit int
+	remoteReadGate        *gate.Gate
+}
+
+func init() {
+	jsoniter.RegisterTypeEncoderFunc("promql.Point", marshalPointJSON, marshalPointJSONIsEmpty)
+	prometheus.MustRegister(remoteReadQueries)
 }
 
 // NewAPI returns an initialized API type.
@@ -146,11 +173,12 @@ func NewAPI(
 	configFunc func() config.Config,
 	flagsMap map[string]string,
 	readyFunc func(http.HandlerFunc) http.HandlerFunc,
-	db func() *tsdb.DB,
+	db func() TSDBAdmin,
 	enableAdmin bool,
 	logger log.Logger,
 	rr rulesRetriever,
-	remoteReadLimit int,
+	remoteReadSampleLimit int,
+	remoteReadConcurrencyLimit int,
 ) *API {
 	return &API{
 		QueryEngine:           qe,
@@ -158,15 +186,16 @@ func NewAPI(
 		targetRetriever:       tr,
 		alertmanagerRetriever: ar,
 
-		now:             time.Now,
-		config:          configFunc,
-		flagsMap:        flagsMap,
-		ready:           readyFunc,
-		db:              db,
-		enableAdmin:     enableAdmin,
-		rulesRetriever:  rr,
-		remoteReadLimit: remoteReadLimit,
-		logger:          logger,
+		now:                   time.Now,
+		config:                configFunc,
+		flagsMap:              flagsMap,
+		ready:                 readyFunc,
+		db:                    db,
+		enableAdmin:           enableAdmin,
+		rulesRetriever:        rr,
+		remoteReadSampleLimit: remoteReadSampleLimit,
+		remoteReadGate:        gate.New(remoteReadConcurrencyLimit),
+		logger:                logger,
 	}
 }
 
@@ -199,6 +228,8 @@ func (api *API) Register(r *route.Router) {
 	r.Get("/query_range", wrap(api.queryRange))
 	r.Post("/query_range", wrap(api.queryRange))
 
+	r.Get("/labels", wrap(api.labelNames))
+	r.Post("/labels", wrap(api.labelNames))
 	r.Get("/label/:name/values", wrap(api.labelValues))
 
 	r.Get("/series", wrap(api.series))
@@ -262,15 +293,7 @@ func (api *API) query(r *http.Request) (interface{}, *apiError, func()) {
 
 	res := qry.Exec(ctx)
 	if res.Err != nil {
-		switch res.Err.(type) {
-		case promql.ErrQueryCanceled:
-			return nil, &apiError{errorCanceled, res.Err}, qry.Close
-		case promql.ErrQueryTimeout:
-			return nil, &apiError{errorTimeout, res.Err}, qry.Close
-		case promql.ErrStorage:
-			return nil, &apiError{errorInternal, res.Err}, qry.Close
-		}
-		return nil, &apiError{errorExec, res.Err}, qry.Close
+		return nil, returnAPIError(res.Err), qry.Close
 	}
 
 	// Optional stats field in response if parameter "stats" is not empty.
@@ -336,13 +359,7 @@ func (api *API) queryRange(r *http.Request) (interface{}, *apiError, func()) {
 
 	res := qry.Exec(ctx)
 	if res.Err != nil {
-		switch res.Err.(type) {
-		case promql.ErrQueryCanceled:
-			return nil, &apiError{errorCanceled, res.Err}, qry.Close
-		case promql.ErrQueryTimeout:
-			return nil, &apiError{errorTimeout, res.Err}, qry.Close
-		}
-		return nil, &apiError{errorExec, res.Err}, qry.Close
+		return nil, returnAPIError(res.Err), qry.Close
 	}
 
 	// Optional stats field in response if parameter "stats" is not empty.
@@ -356,6 +373,37 @@ func (api *API) queryRange(r *http.Request) (interface{}, *apiError, func()) {
 		Result:     res.Value,
 		Stats:      qs,
 	}, nil, qry.Close
+}
+
+func returnAPIError(err error) *apiError {
+	if err == nil {
+		return nil
+	}
+
+	switch err.(type) {
+	case promql.ErrQueryCanceled:
+		return &apiError{errorCanceled, err}
+	case promql.ErrQueryTimeout:
+		return &apiError{errorTimeout, err}
+	case promql.ErrStorage:
+		return &apiError{errorInternal, err}
+	}
+
+	return &apiError{errorExec, err}
+}
+
+func (api *API) labelNames(r *http.Request) (interface{}, *apiError, func()) {
+	q, err := api.Queryable.Querier(r.Context(), math.MinInt64, math.MaxInt64)
+	if err != nil {
+		return nil, &apiError{errorExec, err}, nil
+	}
+	defer q.Close()
+
+	names, err := q.LabelNames()
+	if err != nil {
+		return nil, &apiError{errorExec, err}, nil
+	}
+	return names, nil, nil
 }
 
 func (api *API) labelValues(r *http.Request) (interface{}, *apiError, func()) {
@@ -481,31 +529,46 @@ type TargetDiscovery struct {
 }
 
 func (api *API) targets(r *http.Request) (interface{}, *apiError, func()) {
-	tActive := api.targetRetriever.TargetsActive()
-	tDropped := api.targetRetriever.TargetsDropped()
-	res := &TargetDiscovery{ActiveTargets: make([]*Target, len(tActive)), DroppedTargets: make([]*DroppedTarget, len(tDropped))}
+	flatten := func(targets map[string][]*scrape.Target) []*scrape.Target {
+		var n int
+		keys := make([]string, 0, len(targets))
+		for k := range targets {
+			keys = append(keys, k)
+			n += len(targets[k])
+		}
+		sort.Strings(keys)
+		res := make([]*scrape.Target, 0, n)
+		for _, k := range keys {
+			res = append(res, targets[k]...)
+		}
+		return res
+	}
 
-	for i, t := range tActive {
+	tActive := flatten(api.targetRetriever.TargetsActive())
+	tDropped := flatten(api.targetRetriever.TargetsDropped())
+	res := &TargetDiscovery{ActiveTargets: make([]*Target, 0, len(tActive)), DroppedTargets: make([]*DroppedTarget, 0, len(tDropped))}
+
+	for _, target := range tActive {
 		lastErrStr := ""
-		lastErr := t.LastError()
+		lastErr := target.LastError()
 		if lastErr != nil {
 			lastErrStr = lastErr.Error()
 		}
 
-		res.ActiveTargets[i] = &Target{
-			DiscoveredLabels: t.DiscoveredLabels().Map(),
-			Labels:           t.Labels().Map(),
-			ScrapeURL:        t.URL().String(),
+		res.ActiveTargets = append(res.ActiveTargets, &Target{
+			DiscoveredLabels: target.DiscoveredLabels().Map(),
+			Labels:           target.Labels().Map(),
+			ScrapeURL:        target.URL().String(),
 			LastError:        lastErrStr,
-			LastScrape:       t.LastScrape(),
-			Health:           t.Health(),
-		}
+			LastScrape:       target.LastScrape(),
+			Health:           target.Health(),
+		})
 	}
 
-	for i, t := range tDropped {
-		res.DroppedTargets[i] = &DroppedTarget{
+	for _, t := range tDropped {
+		res.DroppedTargets = append(res.DroppedTargets, &DroppedTarget{
 			DiscoveredLabels: t.DiscoveredLabels().Map(),
-		}
+		})
 	}
 	return res, nil, nil
 }
@@ -528,35 +591,39 @@ func (api *API) targetMetadata(r *http.Request) (interface{}, *apiError, func())
 
 	var res []metricMetadata
 Outer:
-	for _, t := range api.targetRetriever.TargetsActive() {
-		if limit >= 0 && len(res) >= limit {
-			break
-		}
-		for _, m := range matchers {
-			// Filter targets that don't satisfy the label matchers.
-			if !m.Matches(t.Labels().Get(m.Name)) {
-				continue Outer
+	for _, tt := range api.targetRetriever.TargetsActive() {
+		for _, t := range tt {
+			if limit >= 0 && len(res) >= limit {
+				break
 			}
-		}
-		// If no metric is specified, get the full list for the target.
-		if metric == "" {
-			for _, md := range t.MetadataList() {
+			for _, m := range matchers {
+				// Filter targets that don't satisfy the label matchers.
+				if !m.Matches(t.Labels().Get(m.Name)) {
+					continue Outer
+				}
+			}
+			// If no metric is specified, get the full list for the target.
+			if metric == "" {
+				for _, md := range t.MetadataList() {
+					res = append(res, metricMetadata{
+						Target: t.Labels(),
+						Metric: md.Metric,
+						Type:   md.Type,
+						Help:   md.Help,
+						Unit:   md.Unit,
+					})
+				}
+				continue
+			}
+			// Get metadata for the specified metric.
+			if md, ok := t.Metadata(metric); ok {
 				res = append(res, metricMetadata{
 					Target: t.Labels(),
-					Metric: md.Metric,
 					Type:   md.Type,
 					Help:   md.Help,
+					Unit:   md.Unit,
 				})
 			}
-			continue
-		}
-		// Get metadata for the specified metric.
-		if md, ok := t.Metadata(metric); ok {
-			res = append(res, metricMetadata{
-				Target: t.Labels(),
-				Type:   md.Type,
-				Help:   md.Help,
-			})
 		}
 	}
 	if len(res) == 0 {
@@ -570,6 +637,7 @@ type metricMetadata struct {
 	Metric string               `json:"metric,omitempty"`
 	Type   textparse.MetricType `json:"type"`
 	Help   string               `json:"help"`
+	Unit   string               `json:"unit"`
 }
 
 // AlertmanagerDiscovery has all the active Alertmanagers.
@@ -751,6 +819,12 @@ func (api *API) serveFlags(r *http.Request) (interface{}, *apiError, func()) {
 }
 
 func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
+	api.remoteReadGate.Start(r.Context())
+	remoteReadQueries.Inc()
+
+	defer api.remoteReadGate.Done()
+	defer remoteReadQueries.Dec()
+
 	req, err := remote.DecodeReadRequest(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -798,7 +872,7 @@ func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		resp.Results[i], err = remote.ToQueryResult(set, api.remoteReadLimit)
+		resp.Results[i], err = remote.ToQueryResult(set, api.remoteReadSampleLimit)
 		if err != nil {
 			if httpErr, ok := err.(remote.HTTPError); ok {
 				http.Error(w, httpErr.Error(), httpErr.Status())
@@ -892,9 +966,15 @@ func (api *API) snapshot(r *http.Request) (interface{}, *apiError, func()) {
 	if !api.enableAdmin {
 		return nil, &apiError{errorUnavailable, errors.New("Admin APIs disabled")}, nil
 	}
-	skipHead, err := strconv.ParseBool(r.FormValue("skip_head"))
-	if err != nil {
-		return nil, &apiError{errorUnavailable, fmt.Errorf("unable to parse boolean 'skip_head' argument: %v", err)}, nil
+	var (
+		skipHead bool
+		err      error
+	)
+	if r.FormValue("skip_head") != "" {
+		skipHead, err = strconv.ParseBool(r.FormValue("skip_head"))
+		if err != nil {
+			return nil, &apiError{errorBadData, fmt.Errorf("unable to parse boolean 'skip_head' argument: %v", err)}, nil
+		}
 	}
 
 	db := api.db()
@@ -1068,10 +1148,6 @@ func parseDuration(s string) (time.Duration, error) {
 		return time.Duration(d), nil
 	}
 	return 0, fmt.Errorf("cannot parse %q to a valid duration", s)
-}
-
-func init() {
-	jsoniter.RegisterTypeEncoderFunc("promql.Point", marshalPointJSON, marshalPointJSONIsEmpty)
 }
 
 func marshalPointJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
