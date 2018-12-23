@@ -182,6 +182,7 @@ func buildClients(logger log.Logger, cfg *config) ([]writer, []reader) {
 			cfg.remoteTimeout,
 		)
 		writers = append(writers, c)
+		readers = append(readers, c)
 	}
 	if cfg.influxdbURL != "" {
 		url, err := url.Parse(cfg.influxdbURL)

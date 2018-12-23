@@ -26,6 +26,8 @@ import (
 // OpenTSDB tags as well as for OpenTSDB metric names.
 type TagValue model.LabelValue
 
+const defaultEmptyTagValue = "_-"
+
 // MarshalJSON marshals this TagValue into JSON that only contains runes allowed
 // in OpenTSDB. It implements json.Marshaler. The runes allowed in OpenTSDB are
 // all single-byte. This function encodes the arbitrary byte sequence found in
@@ -66,6 +68,9 @@ func (tv TagValue) MarshalJSON() ([]byte, error) {
 	// Need at least two more bytes than in tv.
 	result := bytes.NewBuffer(make([]byte, 0, length+2))
 	result.WriteByte('"')
+	if length == 0 {
+		result.WriteString(defaultEmptyTagValue)
+	}
 	for i := 0; i < length; i++ {
 		b := tv[i]
 		switch {
@@ -155,3 +160,28 @@ func (tv *TagValue) UnmarshalJSON(json []byte) error {
 	*tv = TagValue(result.String())
 	return nil
 }
+
+func toTagValue(tv string) string {
+	length := len(tv)
+	if length == 0 {
+		return defaultEmptyTagValue
+	}
+	result := bytes.NewBuffer(make([]byte, 0, length))
+	for i := 0; i < length; i++ {
+		b := tv[i]
+		switch {
+		case (b >= '-' && b <= '9') || // '-', '.', '/', 0-9
+			(b >= 'A' && b <= 'Z') ||
+			(b >= 'a' && b <= 'z'):
+			result.WriteByte(b)
+		case b == '_':
+			result.WriteString("__")
+		case b == ':':
+			result.WriteString("_.")
+		default:
+			result.WriteString(fmt.Sprintf("_%X", b))
+		}
+	}
+	return result.String()
+}
+
