@@ -34,6 +34,7 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
+	"github.com/golang/glog"
 	"github.com/oklog/oklog/pkg/group"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -41,7 +42,6 @@ import (
 	"github.com/prometheus/common/version"
 	prom_runtime "github.com/prometheus/prometheus/pkg/runtime"
 	"gopkg.in/alecthomas/kingpin.v2"
-	k8s_runtime "k8s.io/apimachinery/pkg/util/runtime"
 
 	"github.com/mwitkow/go-conntrack"
 	"github.com/prometheus/common/promlog"
@@ -101,11 +101,12 @@ func main() {
 
 		prometheusURL string
 
-		logLevel promlog.AllowedLevel
+		promlogConfig promlog.Config
 	}{
 		notifier: notifier.Options{
 			Registerer: prometheus.DefaultRegisterer,
 		},
+		promlogConfig: promlog.Config{},
 	}
 
 	a := kingpin.New(filepath.Base(os.Args[0]), "The Prometheus monitoring server")
@@ -204,7 +205,7 @@ func main() {
 	a.Flag("query.max-samples", "Maximum number of samples a single query can load into memory. Note that queries will fail if they would load more samples than this into memory, so this also limits the number of samples a query can return.").
 		Default("50000000").IntVar(&cfg.queryMaxSamples)
 
-	promlogflag.AddFlags(a, &cfg.logLevel)
+	promlogflag.AddFlags(a, &cfg.promlogConfig)
 
 	_, err := a.Parse(os.Args[1:])
 	if err != nil {
@@ -232,17 +233,13 @@ func main() {
 	}
 
 	promql.LookbackDelta = time.Duration(cfg.lookbackDelta)
+	promql.SetDefaultEvaluationInterval(time.Duration(config.DefaultGlobalConfig.EvaluationInterval))
 
-	logger := promlog.New(cfg.logLevel)
+	logger := promlog.New(&cfg.promlogConfig)
 
-	// XXX(fabxc): Kubernetes does background logging which we can only customize by modifying
-	// a global variable.
-	// Ultimately, here is the best place to set it.
-	k8s_runtime.ErrorHandlers = []func(error){
-		func(err error) {
-			level.Error(log.With(logger, "component", "k8s_client_runtime")).Log("err", err)
-		},
-	}
+	// Above level 6, the k8s client would log bearer tokens in clear-text.
+	glog.ClampLevel(6)
+	glog.SetLogger(log.With(logger, "component", "k8s_client_runtime"))
 
 	level.Info(logger).Log("msg", "Starting Prometheus", "version", version.Info())
 	level.Info(logger).Log("build_context", version.BuildContext())
@@ -260,7 +257,7 @@ func main() {
 		ctxWeb, cancelWeb = context.WithCancel(context.Background())
 		ctxRule           = context.Background()
 
-		notifier = notifier.NewManager(&cfg.notifier, log.With(logger, "component", "notifier"))
+		notifierManager = notifier.NewManager(&cfg.notifier, log.With(logger, "component", "notifier"))
 
 		ctxScrape, cancelScrape = context.WithCancel(context.Background())
 		discoveryManagerScrape  = discovery.NewManager(ctxScrape, log.With(logger, "component", "discovery manager scrape"), discovery.Name("scrape"))
@@ -283,7 +280,7 @@ func main() {
 			Appendable:      fanoutStorage,
 			TSDB:            localStorage,
 			QueryFunc:       rules.EngineQueryFunc(queryEngine, fanoutStorage),
-			NotifyFunc:      sendAlerts(notifier, cfg.web.ExternalURL.String()),
+			NotifyFunc:      sendAlerts(notifierManager, cfg.web.ExternalURL.String()),
 			Context:         ctxRule,
 			ExternalURL:     cfg.web.ExternalURL,
 			Registerer:      prometheus.DefaultRegisterer,
@@ -300,7 +297,7 @@ func main() {
 	cfg.web.QueryEngine = queryEngine
 	cfg.web.ScrapeManager = scrapeManager
 	cfg.web.RuleManager = ruleManager
-	cfg.web.Notifier = notifier
+	cfg.web.Notifier = notifierManager
 
 	cfg.web.Version = &web.PrometheusVersion{
 		Version:   version.Version,
@@ -336,7 +333,7 @@ func main() {
 		webHandler.ApplyConfig,
 		// The Scrape and notifier managers need to reload before the Discovery manager as
 		// they need to read the most updated config when receiving the new targets list.
-		notifier.ApplyConfig,
+		notifierManager.ApplyConfig,
 		scrapeManager.ApplyConfig,
 		func(cfg *config.Config) error {
 			c := make(map[string]sd_config.ServiceDiscoveryConfig)
@@ -615,12 +612,12 @@ func main() {
 				// so we wait until the config is fully loaded.
 				<-reloadReady.C
 
-				notifier.Run(discoveryManagerNotify.SyncCh())
+				notifierManager.Run(discoveryManagerNotify.SyncCh())
 				level.Info(logger).Log("msg", "Notifier manager stopped")
 				return nil
 			},
 			func(err error) {
-				notifier.Stop()
+				notifierManager.Stop()
 			},
 		)
 	}
@@ -658,6 +655,7 @@ func reloadConfig(filename string, logger log.Logger, rls ...func(*config.Config
 	if failed {
 		return fmt.Errorf("one or more errors occurred while applying the new configuration (--config.file=%q)", filename)
 	}
+	promql.SetDefaultEvaluationInterval(time.Duration(conf.GlobalConfig.EvaluationInterval))
 	level.Info(logger).Log("msg", "Completed loading of configuration file", "filename", filename)
 	return nil
 }
@@ -700,8 +698,12 @@ func computeExternalURL(u, listenAddr string) (*url.URL, error) {
 	return eu, nil
 }
 
+type sender interface {
+	Send(alerts ...*notifier.Alert)
+}
+
 // sendAlerts implements the rules.NotifyFunc for a Notifier.
-func sendAlerts(n *notifier.Manager, externalURL string) rules.NotifyFunc {
+func sendAlerts(s sender, externalURL string) rules.NotifyFunc {
 	return func(ctx context.Context, expr string, alerts ...*rules.Alert) {
 		var res []*notifier.Alert
 
@@ -721,7 +723,7 @@ func sendAlerts(n *notifier.Manager, externalURL string) rules.NotifyFunc {
 		}
 
 		if len(alerts) > 0 {
-			n.Send(res...)
+			s.Send(res...)
 		}
 	}
 }

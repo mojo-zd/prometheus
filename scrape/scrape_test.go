@@ -29,6 +29,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/prometheus/pkg/relabel"
+
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
 
@@ -68,10 +70,10 @@ func TestDroppedTargetsList(t *testing.T) {
 		cfg = &config.ScrapeConfig{
 			JobName:        "dropMe",
 			ScrapeInterval: model.Duration(1),
-			RelabelConfigs: []*config.RelabelConfig{
+			RelabelConfigs: []*relabel.Config{
 				{
-					Action:       config.RelabelDrop,
-					Regex:        mustNewRegexp("dropMe"),
+					Action:       relabel.Drop,
+					Regex:        relabel.MustNewRegexp("dropMe"),
 					SourceLabels: model.LabelNames{"job"},
 				},
 			},
@@ -219,7 +221,7 @@ func TestScrapePoolReload(t *testing.T) {
 	}
 	// On starting to run, new loops created on reload check whether their preceding
 	// equivalents have been stopped.
-	newLoop := func(_ *Target, s scraper, _ int, _ bool, _ []*config.RelabelConfig) loop {
+	newLoop := func(_ *Target, s scraper, _ int, _ bool, _ []*relabel.Config) loop {
 		l := &testLoop{}
 		l.startFunc = func(interval, timeout time.Duration, errc chan<- error) {
 			if interval != 3*time.Second {
@@ -1212,9 +1214,11 @@ func TestTargetScraperScrapeOK(t *testing.T) {
 	}
 	var buf bytes.Buffer
 
-	if _, err := ts.scrape(context.Background(), &buf); err != nil {
+	contentType, err := ts.scrape(context.Background(), &buf)
+	if err != nil {
 		t.Fatalf("Unexpected scrape error: %s", err)
 	}
+	require.Equal(t, "text/plain; version=0.0.4", contentType)
 	require.Equal(t, "metric_a 1\nmetric_b 2\n", buf.String())
 }
 
